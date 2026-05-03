@@ -572,18 +572,45 @@ class GodotServer {
   }
 
   private classifyGodotMessages(lines: string[]): Record<string, string[]> {
-    const cleaned = lines.map(line => line.trim()).filter(Boolean);
+    const cleaned = lines
+      .map(line => line.trim())
+      .filter(Boolean)
+      .filter(line => !this.isBenignGodotDiagnostic(line));
     const pick = (patterns: RegExp[]) => cleaned.filter(line => patterns.some(pattern => pattern.test(line)));
 
     return {
-      importErrors: pick([/import/i, /reimport/i, /failed to load resource/i]),
+      importErrors: pick([
+        /\b(import|reimport)\b.*\b(error|fail|failed|missing|invalid)\b/i,
+        /\b(error|fail|failed|missing|invalid)\b.*\b(import|reimport)\b/i,
+        /failed (loading|to load) resource/i,
+        /no loader found for resource/i,
+      ]),
       gdscriptErrors: pick([/script error/i, /parse error/i, /gdscript/i, /invalid call/i, /invalid get index/i]),
       signalErrors: pick([/signal/i, /connect.*failed/i, /failed.*connect/i, /disconnect.*failed/i]),
-      resourceErrors: pick([/res:\/\//i, /resource/i, /scene file/i, /can't load/i, /cannot load/i]),
+      resourceErrors: pick([
+        /failed (loading|to load) resource/i,
+        /no loader found for resource/i,
+        /referenced non-existent resource/i,
+        /can't load/i,
+        /cannot load/i,
+        /scene file.*\b(error|fail|failed|missing|invalid)\b/i,
+      ]),
       collisionErrors: pick([/collision/i, /physics/i, /shape/i, /area2d/i, /body/i]),
       runtimeErrors: pick([/\berror\b/i, /\berr_/i, /failed/i, /exception/i]),
       warnings: pick([/warning/i, /\bwarn\b/i]),
     };
+  }
+
+  private isBenignGodotDiagnostic(line: string): boolean {
+    return [
+      /^Loading resource:/i,
+      /^Loading cache for shader/i,
+      /^Shader '.+' \(group \d+\) SHA256:/i,
+      /^Shader cache (hit|miss)/i,
+      /^Loaded system CA certificates/i,
+      /^ERROR: GENERAL - Message Id Number: 0 \| Message Id Name: Loader Message$/i,
+      /loader_get_json: Failed to open JSON file .*Rockstar Games.*SocialClubVulkanLayer\.json/i,
+    ].some(pattern => pattern.test(line));
   }
 
   private async ensureRunnableProject(projectPath: string): Promise<string | null> {
