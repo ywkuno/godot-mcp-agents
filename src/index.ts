@@ -9,6 +9,7 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize } from 'path';
+import { tmpdir } from 'os';
 import { existsSync, readdirSync, readFileSync, writeFileSync, copyFileSync, unlinkSync, mkdirSync, renameSync } from 'fs';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
@@ -95,7 +96,8 @@ class GodotServer {
   private lastErrorIndex: number = 0;
   private lastLogIndex: number = 0;
   private readonly INTERACTION_PORT = 9090;
-  private readonly AUTOLOAD_NAME = 'McpInteractionServer';
+  private readonly AUTOLOAD_NAME = 'CodexMcpInteractionServer';
+  private readonly INTERACTION_RESOURCE_PATH = 'res://addons/codex_mcp/mcp_interaction_server.gd';
 
   constructor(config?: GodotServerConfig) {
     // Apply configuration if provided
@@ -336,9 +338,12 @@ class GodotServer {
   /**
    * Inject the interaction server script into the Godot project
    */
-  private injectInteractionServer(projectPath: string): void {
+  private installInteractionServer(projectPath: string): { scriptPath: string; autoloadLine: string; projectSettingsChanged: boolean } {
     const projectFile = join(projectPath, 'project.godot');
-    const destScript = join(projectPath, 'mcp_interaction_server.gd');
+    const addonDir = join(projectPath, 'addons', 'codex_mcp');
+    const destScript = join(addonDir, 'mcp_interaction_server.gd');
+
+    mkdirSync(addonDir, { recursive: true });
 
     // Copy the interaction script into the project
     copyFileSync(this.interactionScriptPath, destScript);
@@ -346,16 +351,14 @@ class GodotServer {
 
     // Add autoload entry to project.godot
     let content = readFileSync(projectFile, 'utf8');
+    const originalContent = content;
+    const autoloadLine = `${this.AUTOLOAD_NAME}="*${this.INTERACTION_RESOURCE_PATH}"`;
+    const autoloadRegex = new RegExp(`^${this.AUTOLOAD_NAME}=.*$`, 'm');
 
     // Check if already injected
-    if (content.includes(this.AUTOLOAD_NAME)) {
-      this.logDebug('Interaction server autoload already present');
-      return;
-    }
-
-    const autoloadLine = `${this.AUTOLOAD_NAME}="*res://mcp_interaction_server.gd"`;
-
-    if (content.includes('[autoload]')) {
+    if (autoloadRegex.test(content)) {
+      content = content.replace(autoloadRegex, autoloadLine);
+    } else if (content.includes('[autoload]')) {
       // Add after existing [autoload] section header
       content = content.replace('[autoload]', `[autoload]\n\n${autoloadLine}`);
     } else {
@@ -363,8 +366,19 @@ class GodotServer {
       content += `\n[autoload]\n\n${autoloadLine}\n`;
     }
 
-    writeFileSync(projectFile, content, 'utf8');
+    const projectSettingsChanged = content !== originalContent;
+    if (projectSettingsChanged) {
+      writeFileSync(projectFile, content, 'utf8');
+    }
     this.logDebug(`Injected ${this.AUTOLOAD_NAME} autoload into project.godot`);
+    return { scriptPath: destScript, autoloadLine, projectSettingsChanged };
+  }
+
+  /**
+   * Inject the interaction server script into the Godot project
+   */
+  private injectInteractionServer(projectPath: string): void {
+    this.installInteractionServer(projectPath);
   }
 
   /**
@@ -372,13 +386,13 @@ class GodotServer {
    */
   private removeInteractionServer(projectPath: string): void {
     const projectFile = join(projectPath, 'project.godot');
-    const destScript = join(projectPath, 'mcp_interaction_server.gd');
+    const destScript = join(projectPath, 'addons', 'codex_mcp', 'mcp_interaction_server.gd');
 
     // Remove autoload line from project.godot
     if (existsSync(projectFile)) {
       let content = readFileSync(projectFile, 'utf8');
       // Remove the autoload line (and any surrounding blank line)
-      const autoloadLine = `${this.AUTOLOAD_NAME}="*res://mcp_interaction_server.gd"`;
+      const autoloadLine = `${this.AUTOLOAD_NAME}="*${this.INTERACTION_RESOURCE_PATH}"`;
       content = content.replace(new RegExp(`\\n?${autoloadLine.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n?`), '\n');
       writeFileSync(projectFile, content, 'utf8');
       this.logDebug('Removed interaction server autoload from project.godot');
@@ -525,10 +539,7 @@ class GodotServer {
   private async cleanup() {
     this.logDebug('Cleaning up resources');
     this.disconnectFromGame();
-    if (this.gameConnection.projectPath) {
-      this.removeInteractionServer(this.gameConnection.projectPath);
-      this.gameConnection.projectPath = null;
-    }
+    this.gameConnection.projectPath = null;
     if (this.activeProcess) {
       this.logDebug('Killing active Godot process');
       this.activeProcess.process.kill();
@@ -553,6 +564,43 @@ class GodotServer {
     } catch (error: any) {
       return createErrorResponse(`${name} failed: ${error?.message || 'Unknown error'}`);
     }
+  }
+
+  private async waitForMilliseconds(ms: number): Promise<void> {
+    if (ms <= 0) return;
+    await new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  private classifyGodotMessages(lines: string[]): Record<string, string[]> {
+    const cleaned = lines.map(line => line.trim()).filter(Boolean);
+    const pick = (patterns: RegExp[]) => cleaned.filter(line => patterns.some(pattern => pattern.test(line)));
+
+    return {
+      importErrors: pick([/import/i, /reimport/i, /failed to load resource/i]),
+      gdscriptErrors: pick([/script error/i, /parse error/i, /gdscript/i, /invalid call/i, /invalid get index/i]),
+      signalErrors: pick([/signal/i, /connect.*failed/i, /failed.*connect/i, /disconnect.*failed/i]),
+      resourceErrors: pick([/res:\/\//i, /resource/i, /scene file/i, /can't load/i, /cannot load/i]),
+      collisionErrors: pick([/collision/i, /physics/i, /shape/i, /area2d/i, /body/i]),
+      runtimeErrors: pick([/\berror\b/i, /\berr_/i, /failed/i, /exception/i]),
+      warnings: pick([/warning/i, /\bwarn\b/i]),
+    };
+  }
+
+  private async ensureRunnableProject(projectPath: string): Promise<string | null> {
+    if (!this.godotPath) {
+      await this.detectGodotPath();
+    }
+    if (!this.godotPath) {
+      return 'Could not find a valid Godot executable path';
+    }
+    if (!validatePath(projectPath)) {
+      return 'Invalid project path';
+    }
+    const projectFile = join(projectPath, 'project.godot');
+    if (!existsSync(projectFile)) {
+      return `Not a valid Godot project: ${projectPath}`;
+    }
+    return null;
   }
 
   private async headlessOp(
@@ -798,6 +846,80 @@ class GodotServer {
               scene: {
                 type: 'string',
                 description: 'Optional: Specific scene to run',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
+          name: 'run_scene',
+          description: 'Run a specific Godot scene with CLI debug output',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Godot project path',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Scene path or UID to run',
+              },
+              debug: {
+                type: 'boolean',
+                description: 'Enable local stdout debugger (default: true)',
+              },
+              verbose: {
+                type: 'boolean',
+                description: 'Enable verbose stdout mode (default: false)',
+              },
+              timeoutMs: {
+                type: 'number',
+                description: 'Milliseconds to collect output before returning',
+              },
+              captureOutput: {
+                type: 'boolean',
+                description: 'Attach stdout/stderr capture buffers (default: true)',
+              },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
+          name: 'smoke_scene',
+          description: 'Run a Godot scene briefly, collect logs, and stop it',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Godot project path',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Scene path or UID to smoke-test',
+              },
+              timeoutMs: {
+                type: 'number',
+                description: 'Milliseconds to run before stopping (default: 5000)',
+              },
+              verbose: {
+                type: 'boolean',
+                description: 'Enable verbose stdout mode (default: true)',
+              },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
+          name: 'install_runtime_bridge',
+          description: 'Install the Codex runtime bridge autoload into a project',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Godot project path',
               },
             },
             required: ['projectPath'],
@@ -1121,6 +1243,28 @@ class GodotServer {
           inputSchema: {
             type: 'object',
             properties: {},
+            required: [],
+          },
+        },
+        {
+          name: 'raid_bloom_probe',
+          description: 'Probe Raid Bloom sandbox runtime state',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              playerPath: {
+                type: 'string',
+                description: 'Optional player node path',
+              },
+              bossPath: {
+                type: 'string',
+                description: 'Optional boss node path',
+              },
+              mechanicsPath: {
+                type: 'string',
+                description: 'Optional mechanics root node path',
+              },
+            },
             required: [],
           },
         },
@@ -3199,6 +3343,12 @@ class GodotServer {
           return await this.handleLaunchEditor(request.params.arguments);
         case 'run_project':
           return await this.handleRunProject(request.params.arguments);
+        case 'run_scene':
+          return await this.handleRunScene(request.params.arguments);
+        case 'smoke_scene':
+          return await this.handleSmokeScene(request.params.arguments);
+        case 'install_runtime_bridge':
+          return await this.handleInstallRuntimeBridge(request.params.arguments);
         case 'get_debug_output':
           return await this.handleGetDebugOutput();
         case 'stop_project':
@@ -3235,6 +3385,8 @@ class GodotServer {
           return await this.handleGameGetUi();
         case 'game_get_scene_tree':
           return await this.handleGameGetSceneTree();
+        case 'raid_bloom_probe':
+          return await this.handleRaidBloomProbe(request.params.arguments);
         // New runtime interaction tools
         case 'game_eval':
           return await this.handleGameEval(request.params.arguments);
@@ -3627,9 +3779,6 @@ class GodotServer {
       if (this.activeProcess) {
         this.logDebug('Killing existing Godot process before starting a new one');
         this.disconnectFromGame();
-        if (this.gameConnection.projectPath) {
-          this.removeInteractionServer(this.gameConnection.projectPath);
-        }
         this.activeProcess.process.kill();
       }
 
@@ -3666,10 +3815,7 @@ class GodotServer {
       process.on('exit', (code: number | null) => {
         this.logDebug(`Godot process exited with code ${code}`);
         this.disconnectFromGame();
-        if (this.gameConnection.projectPath) {
-          this.removeInteractionServer(this.gameConnection.projectPath);
-          this.gameConnection.projectPath = null;
-        }
+        this.gameConnection.projectPath = null;
         if (this.activeProcess && this.activeProcess.process === process) {
           this.activeProcess = null;
         }
@@ -3702,6 +3848,223 @@ class GodotServer {
       return createErrorResponse(
         `Failed to run Godot project: ${errorMessage}`
       );
+    }
+  }
+
+  private async handleRunScene(args: any) {
+    args = normalizeParameters(args || {});
+
+    if (!args.projectPath) return createErrorResponse('Project path is required');
+    if (!args.scenePath) return createErrorResponse('Scene path is required');
+    if (!validatePath(args.scenePath)) return createErrorResponse('Invalid scene path');
+
+    const projectError = await this.ensureRunnableProject(args.projectPath);
+    if (projectError) return createErrorResponse(projectError);
+
+    try {
+      if (this.activeProcess) {
+        this.logDebug('Killing existing Godot process before running scene');
+        this.disconnectFromGame();
+        this.activeProcess.process.kill();
+        this.activeProcess = null;
+        this.gameConnection.projectPath = null;
+      }
+
+      const bridge = this.installInteractionServer(args.projectPath);
+      const captureOutput = args.captureOutput !== false;
+      const timeoutMs = Number(args.timeoutMs ?? 0);
+      const logFile = join(
+        tmpdir(),
+        `godot-mcp-${Date.now()}-${Math.random().toString(16).slice(2)}.log`
+      );
+
+      const cmdArgs = ['--path', args.projectPath, '--scene', args.scenePath];
+      if (args.debug !== false) cmdArgs.push('--debug');
+      if (args.verbose === true) cmdArgs.push('--verbose');
+      if (captureOutput) cmdArgs.push('--log-file', logFile);
+
+      this.logDebug(`Running Godot scene: ${args.scenePath} in ${args.projectPath}`);
+      const godotProcess = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe' });
+      const output: string[] = [];
+      const errors: string[] = [];
+
+      godotProcess.stdout?.on('data', (data: Buffer) => {
+        const lines = data.toString().split(/\r?\n/);
+        output.push(...lines);
+        lines.forEach((line: string) => {
+          if (line.trim()) this.logDebug(`[Godot stdout] ${line}`);
+        });
+      });
+
+      godotProcess.stderr?.on('data', (data: Buffer) => {
+        const lines = data.toString().split(/\r?\n/);
+        errors.push(...lines);
+        lines.forEach((line: string) => {
+          if (line.trim()) this.logDebug(`[Godot stderr] ${line}`);
+        });
+      });
+
+      godotProcess.on('exit', (code: number | null) => {
+        this.logDebug(`Godot scene process exited with code ${code}`);
+        this.disconnectFromGame();
+        this.gameConnection.projectPath = null;
+        if (this.activeProcess && this.activeProcess.process === godotProcess) {
+          this.activeProcess = null;
+        }
+      });
+
+      godotProcess.on('error', (err: Error) => {
+        console.error('Failed to start Godot scene process:', err);
+        if (this.activeProcess && this.activeProcess.process === godotProcess) {
+          this.activeProcess = null;
+        }
+      });
+
+      this.activeProcess = { process: godotProcess, output, errors };
+
+      this.connectToGame(args.projectPath).catch(err => {
+        this.logDebug(`Failed to connect to game interaction server: ${err}`);
+      });
+
+      await this.waitForMilliseconds(timeoutMs);
+
+      let logOutput = '';
+      if (captureOutput && existsSync(logFile)) {
+        try {
+          logOutput = readFileSync(logFile, 'utf8');
+        } catch (error: any) {
+          errors.push(`Failed to read Godot log file ${logFile}: ${error?.message || 'Unknown error'}`);
+        }
+      }
+
+      const running = this.activeProcess?.process === godotProcess && godotProcess.exitCode === null;
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                message: 'Godot scene started',
+                projectPath: args.projectPath,
+                scenePath: args.scenePath,
+                commandArgs: cmdArgs,
+                bridge,
+                running,
+                runtimeConnection: this.gameConnection.connected,
+                output,
+                errors,
+                logFile: captureOutput ? logFile : null,
+                logOutput,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error: any) {
+      return createErrorResponse(`Failed to run Godot scene: ${error?.message || 'Unknown error'}`);
+    }
+  }
+
+  private async handleSmokeScene(args: any) {
+    args = normalizeParameters(args || {});
+    const timeoutMs = Number(args.timeoutMs ?? 5000);
+
+    const runResult = await this.handleRunScene({
+      ...args,
+      debug: true,
+      verbose: args.verbose !== false,
+      captureOutput: true,
+      timeoutMs,
+    });
+
+    if (runResult.isError) return runResult;
+
+    let runPayload: any = {};
+    try {
+      runPayload = JSON.parse(runResult.content?.[0]?.text || '{}');
+    } catch {
+      runPayload = {};
+    }
+
+    const output = [...(runPayload.output || [])];
+    const errors = [...(runPayload.errors || [])];
+    const logLines = String(runPayload.logOutput || '').split(/\r?\n/);
+    const classifications = this.classifyGodotMessages([...output, ...errors, ...logLines]);
+
+    let stopPayload: any = null;
+    if (this.activeProcess) {
+      const stopResult = await this.handleStopProject();
+      try {
+        stopPayload = JSON.parse(stopResult.content?.[0]?.text || '{}');
+      } catch {
+        stopPayload = null;
+      }
+    }
+
+    const blockingCategories = Object.entries(classifications)
+      .filter(([name, matches]) => name !== 'warnings' && (matches as string[]).length > 0)
+      .map(([name]) => name);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              message: 'Godot scene smoke test completed',
+              projectPath: args.projectPath,
+              scenePath: args.scenePath,
+              timeoutMs,
+              runningDuringSample: runPayload.running === true,
+              runtimeConnection: runPayload.runtimeConnection === true,
+              commandArgs: runPayload.commandArgs || [],
+              logFile: runPayload.logFile || null,
+              classifications,
+              hasBlockingErrors: blockingCategories.length > 0,
+              blockingCategories,
+              output,
+              errors,
+              stop: stopPayload,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+
+  private async handleInstallRuntimeBridge(args: any) {
+    args = normalizeParameters(args || {});
+    if (!args.projectPath) return createErrorResponse('Project path is required');
+
+    const projectError = await this.ensureRunnableProject(args.projectPath);
+    if (projectError) return createErrorResponse(projectError);
+
+    try {
+      const bridge = this.installInteractionServer(args.projectPath);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                message: 'Runtime bridge installed',
+                projectPath: args.projectPath,
+                autoloadName: this.AUTOLOAD_NAME,
+                resourcePath: this.INTERACTION_RESOURCE_PATH,
+                ...bridge,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error: any) {
+      return createErrorResponse(`Failed to install runtime bridge: ${error?.message || 'Unknown error'}`);
     }
   }
 
@@ -3751,11 +4114,7 @@ class GodotServer {
     this.lastErrorIndex = 0;
     this.lastLogIndex = 0;
 
-    // Remove injected interaction server
-    if (this.gameConnection.projectPath) {
-      this.removeInteractionServer(this.gameConnection.projectPath);
-      this.gameConnection.projectPath = null;
-    }
+    this.gameConnection.projectPath = null;
 
     return {
       content: [
@@ -4513,6 +4872,15 @@ class GodotServer {
 
   private async handleGameGetSceneTree() {
     return this.gameCommand('get_scene_tree', {}, () => ({}));
+  }
+
+  private async handleRaidBloomProbe(args: any) {
+    args = normalizeParameters(args || {});
+    return this.gameCommand('raid_bloom_probe', args, a => ({
+      ...(a.playerPath ? { player_path: a.playerPath } : {}),
+      ...(a.bossPath ? { boss_path: a.bossPath } : {}),
+      ...(a.mechanicsPath ? { mechanics_path: a.mechanicsPath } : {}),
+    }));
   }
 
   private async handleGameEval(args: any) {

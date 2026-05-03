@@ -13,10 +13,12 @@ const PORT: int = 9090
 const BUSY_TIMEOUT: float = 30.0
 var _key_map: Dictionary
 var _held_keys: Dictionary = {}
+var _queued_input_events: Array[InputEvent] = []
 
 func _ready() -> void:
 	# Ensure MCP server keeps processing even when game is paused
 	process_mode = Node.PROCESS_MODE_ALWAYS
+	process_priority = -1000
 	_init_key_map()
 	_server = TCPServer.new()
 	var err: int = _server.listen(PORT, "127.0.0.1")
@@ -24,6 +26,14 @@ func _ready() -> void:
 		push_error("McpInteractionServer: Failed to listen on port %d, error: %d" % [PORT, err])
 		return
 	print("McpInteractionServer: Listening on 127.0.0.1:%d" % PORT)
+
+
+func _physics_process(_delta: float) -> void:
+	if _queued_input_events.is_empty():
+		return
+	for event in _queued_input_events:
+		Input.parse_input_event(event)
+	_queued_input_events.clear()
 
 
 func _process(_delta: float) -> void:
@@ -322,6 +332,8 @@ func _handle_command(json_str: String) -> void:
 			_cmd_render_settings(params)
 		"resource":
 			_cmd_resource(params)
+		"raid_bloom_probe":
+			_cmd_raid_bloom_probe(params)
 		_:
 			_send_response({"error": "Unknown command: %s" % command})
 
@@ -396,11 +408,11 @@ func _cmd_key_press(params: Dictionary) -> void:
 	var pressed: bool = params.get("pressed", true)
 
 	if action.length() > 0:
-		# Simulate an action press/release
-		if pressed:
-			Input.action_press(action)
-		else:
-			Input.action_release(action)
+		var action_event: InputEventAction = InputEventAction.new()
+		action_event.action = action
+		action_event.pressed = pressed
+		action_event.strength = 1.0 if pressed else 0.0
+		_queued_input_events.append(action_event)
 		_send_response({"success": true, "action": action, "pressed": pressed})
 		return
 
@@ -498,6 +510,87 @@ func _build_tree_node(node: Node) -> Dictionary:
 	if children_arr.size() > 0:
 		info["children"] = children_arr
 	return info
+
+
+# --- Raid Bloom sandbox probe ---
+func _cmd_raid_bloom_probe(params: Dictionary) -> void:
+	var current_scene: Node = get_tree().current_scene
+	if current_scene == null:
+		_send_response({"error": "No current scene is loaded"})
+		return
+
+	var player: Node = _resolve_probe_node(params.get("player_path", ""), current_scene, ["Player"])
+	var boss: Node = _resolve_probe_node(params.get("boss_path", ""), current_scene, ["Boss", "AncientRootIdol"])
+	var mechanics: Node = _resolve_probe_node(params.get("mechanics_path", ""), current_scene, ["Mechanics"])
+
+	_send_response({
+		"success": true,
+		"current_scene": {
+			"name": current_scene.name,
+			"path": str(current_scene.get_path()),
+			"scene_file_path": current_scene.scene_file_path,
+		},
+		"player": _probe_combatant(player),
+		"boss": _probe_combatant(boss),
+		"mechanics": {
+			"exists": mechanics != null,
+			"path": str(mechanics.get_path()) if mechanics != null else "",
+			"active_aoe_count": mechanics.get_child_count() if mechanics != null else 0,
+		},
+		"runtime_error_count": 0,
+		"runtime_error_source": "Godot stdout/stderr is classified by smoke_scene"
+	})
+
+
+func _resolve_probe_node(path: String, root: Node, fallback_names: Array) -> Node:
+	if not path.is_empty():
+		var explicit_node: Node = get_node_or_null(path)
+		if explicit_node != null:
+			return explicit_node
+		explicit_node = root.get_node_or_null(path)
+		if explicit_node != null:
+			return explicit_node
+	return _find_first_child_by_names(root, fallback_names)
+
+
+func _find_first_child_by_names(root: Node, names: Array) -> Node:
+	for child in root.get_children():
+		if names.has(String(child.name)):
+			return child
+	for child in root.get_children():
+		var found: Node = _find_first_child_by_names(child, names)
+		if found != null:
+			return found
+	return null
+
+
+func _probe_combatant(node: Node) -> Dictionary:
+	if node == null:
+		return {"exists": false}
+
+	var health: Node = node.get_node_or_null("HealthComponent")
+	if health == null:
+		var health_property: Variant = node.get("health")
+		if health_property is Node:
+			health = health_property
+
+	var result: Dictionary = {
+		"exists": true,
+		"name": node.name,
+		"type": node.get_class(),
+		"path": str(node.get_path()),
+		"position": _variant_to_json(node.get("global_position")),
+		"health_exists": health != null,
+	}
+
+	if health != null:
+		var hp_value: Variant = health.get("hp")
+		var max_hp_value: Variant = health.get("max_hp")
+		result["hp"] = hp_value
+		result["max_hp"] = max_hp_value
+		result["alive"] = float(hp_value) > 0.0 if hp_value != null else null
+
+	return result
 
 
 # --- Key String to Keycode ---

@@ -7,11 +7,12 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const ALL_TOOL_NAMES = [
   'launch_editor', 'run_project', 'get_debug_output', 'stop_project',
+  'run_scene', 'smoke_scene', 'install_runtime_bridge',
   'get_godot_version', 'list_projects', 'get_project_info', 'create_scene',
   'add_node', 'load_sprite', 'export_mesh_library', 'save_scene',
   'get_uid', 'update_project_uids', 'game_screenshot', 'game_click',
   'game_key_press', 'game_mouse_move', 'game_get_ui', 'game_get_scene_tree',
-  'game_eval', 'game_get_property', 'game_set_property', 'game_call_method',
+  'raid_bloom_probe', 'game_eval', 'game_get_property', 'game_set_property', 'game_call_method',
   'game_get_node_info', 'game_instantiate_scene', 'game_remove_node',
   'game_change_scene', 'game_pause', 'game_performance', 'game_wait',
   'read_scene', 'modify_scene_node', 'remove_scene_node',
@@ -71,8 +72,8 @@ beforeAll(() => {
 });
 
 describe('Tool definitions', () => {
-  it('defines exactly 154 tools', () => {
-    expect(ALL_TOOL_NAMES).toHaveLength(154);
+  it('defines exactly 158 tools', () => {
+    expect(ALL_TOOL_NAMES).toHaveLength(158);
   });
 
   it('all tool names are unique', () => {

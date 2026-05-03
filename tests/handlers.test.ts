@@ -1058,6 +1058,24 @@ describe('Lifecycle handlers', () => {
     expect(sourceCode).toContain('spawn(');
   });
 
+  it('handleRunScene uses Godot 4 --scene CLI launch', () => {
+    expect(sourceCode).toContain('handleRunScene');
+    expect(sourceCode).toContain("'--scene'");
+    expect(sourceCode).toContain('timeoutMs');
+  });
+
+  it('handleSmokeScene classifies output and stops the process', () => {
+    expect(sourceCode).toContain('handleSmokeScene');
+    expect(sourceCode).toContain('classifyGodotMessages');
+    expect(sourceCode).toContain('handleStopProject');
+  });
+
+  it('handleInstallRuntimeBridge installs isolated autoload path', () => {
+    expect(sourceCode).toContain('handleInstallRuntimeBridge');
+    expect(sourceCode).toContain('addons');
+    expect(sourceCode).toContain('codex_mcp');
+  });
+
   it('handleStopProject exists and kills process', () => {
     expect(sourceCode).toContain('handleStopProject');
     // Should have some form of process termination
@@ -1932,8 +1950,8 @@ describe('Tool dispatch switch statement', () => {
   it('every case returns await this.handle*', () => {
     const caseRegex = /case '(\w+)':\s*\n\s*return await this\.handle/g;
     const matches = [...sourceCode.matchAll(caseRegex)];
-    // Should match all 154 tools
-    expect(matches.length).toBe(154);
+    // Should match all 158 tools
+    expect(matches.length).toBe(158);
   });
 
   it('no case falls through without return', () => {

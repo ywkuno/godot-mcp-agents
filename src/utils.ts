@@ -152,6 +152,11 @@ export const PARAMETER_MAPPINGS: Record<string, string> = {
   'scaling_scale': 'scalingScale',
   'source_path': 'sourcePath',
   'new_name': 'newName',
+  'timeout_ms': 'timeoutMs',
+  'capture_output': 'captureOutput',
+  'player_path': 'playerPath',
+  'boss_path': 'bossPath',
+  'mechanics_path': 'mechanicsPath',
 };
 
 export const REVERSE_PARAMETER_MAPPINGS: Record<string, string> = Object.fromEntries(
