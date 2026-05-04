@@ -41,6 +41,107 @@ const GODOT_DEBUG_MODE: boolean = true; // Always use GODOT DEBUG MODE
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * Tool-budget filtering for hosts (Claude Code, Cursor, etc.) that prefer
+ * a smaller per-server tool surface. Configure via environment variables:
+ *
+ *   GODOT_MCP_TIER=full|lite|minimal
+ *     - full    (default): all 158 tools.
+ *     - lite   : drops advanced 3D, networking, advanced audio, advanced
+ *                animation, and engine niche tools. ~90 tools.
+ *     - minimal: project + scene + file I/O + core runtime only. ~45 tools.
+ *
+ *   GODOT_MCP_DISABLED_TOOLS=tool_a,tool_b
+ *     Comma-separated list of tool names to drop *in addition to* the tier.
+ *
+ *   GODOT_MCP_ENABLED_TOOLS=tool_a,tool_b
+ *     If set, only these tools are exposed (overrides tier and disabled-list).
+ */
+const TIER_LITE_DROP: ReadonlyArray<string> = [
+  // Advanced 3D
+  'game_csg', 'game_multimesh', 'game_procedural_mesh', 'game_gridmap',
+  'game_3d_effects', 'game_gi', 'game_path_3d', 'game_sky',
+  'game_camera_attributes', 'game_navigation_3d', 'game_physics_3d',
+  'game_skeleton_ik', 'game_bone_pose',
+  // Advanced 2D / canvas
+  'game_canvas', 'game_canvas_draw', 'game_parallax', 'game_shape_2d',
+  'game_path_2d', 'game_physics_2d', 'game_light_2d',
+  // Networking
+  'game_http_request', 'game_websocket', 'game_multiplayer', 'game_rpc',
+  // Advanced audio
+  'game_audio_effect', 'game_audio_bus_layout', 'game_audio_spatial',
+  // Advanced animation
+  'game_animation_tree', 'game_animation_control',
+  // Engine niche
+  'game_visual_shader', 'game_terrain', 'game_video',
+  'game_render_settings', 'game_create_joint', 'game_viewport',
+  'game_debug_draw', 'game_set_particles',
+  // CI / Docker / theming editor extras
+  'manage_ci_pipeline', 'manage_docker_export', 'manage_theme_resource',
+  'manage_translations', 'game_locale',
+  // UI extras (keep a couple in lite)
+  'game_ui_tree', 'game_ui_item_list', 'game_ui_tabs', 'game_ui_menu',
+  'game_ui_range', 'game_ui_theme',
+];
+
+const TIER_MINIMAL_KEEP: ReadonlyArray<string> = [
+  // Project lifecycle
+  'launch_editor', 'run_project', 'run_scene', 'smoke_scene',
+  'install_runtime_bridge', 'get_debug_output', 'stop_project',
+  'get_godot_version', 'list_projects', 'get_project_info',
+  'create_project',
+  // Scene management
+  'create_scene', 'add_node', 'load_sprite', 'save_scene',
+  'read_scene', 'modify_scene_node', 'remove_scene_node', 'attach_script',
+  'create_resource', 'create_script',
+  // Project settings
+  'read_project_settings', 'modify_project_settings', 'list_project_files',
+  'manage_autoloads', 'manage_input_map', 'set_main_scene',
+  // File I/O
+  'read_file', 'write_file', 'delete_file', 'create_directory', 'rename_file',
+  // Core runtime
+  'game_screenshot', 'game_get_ui', 'game_get_scene_tree',
+  'game_get_node_info', 'game_eval', 'game_get_property', 'game_set_property',
+  'game_call_method', 'game_pause', 'game_performance', 'game_wait',
+  'game_get_errors', 'game_get_logs',
+  'game_click', 'game_key_press', 'game_mouse_move',
+  // Project-specific
+  'raid_bloom_probe',
+];
+
+function parseToolNameList(raw: string | undefined): Set<string> {
+  if (!raw) return new Set();
+  return new Set(
+    raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0)
+  );
+}
+
+function resolveAllowedTools(allToolNames: ReadonlyArray<string>): Set<string> {
+  const enabled = parseToolNameList(process.env.GODOT_MCP_ENABLED_TOOLS);
+  if (enabled.size > 0) {
+    return new Set(allToolNames.filter((n) => enabled.has(n)));
+  }
+
+  const tier = (process.env.GODOT_MCP_TIER ?? 'full').toLowerCase();
+  let allowed: Set<string>;
+  if (tier === 'minimal') {
+    const keep = new Set<string>(TIER_MINIMAL_KEEP);
+    allowed = new Set(allToolNames.filter((n) => keep.has(n)));
+  } else if (tier === 'lite') {
+    const drop = new Set<string>(TIER_LITE_DROP);
+    allowed = new Set(allToolNames.filter((n) => !drop.has(n)));
+  } else {
+    allowed = new Set(allToolNames);
+  }
+
+  const disabled = parseToolNameList(process.env.GODOT_MCP_DISABLED_TOOLS);
+  for (const name of disabled) allowed.delete(name);
+  return allowed;
+}
+
 // Derive __filename and __dirname in ESM
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -137,8 +238,8 @@ class GodotServer {
     // Initialize the MCP server
     this.server = new Server(
       {
-        name: 'godot-mcp',
-        version: '0.1.0',
+        name: 'godot-mcp-agents',
+        version: '0.2.0',
       },
       {
         capabilities: {
@@ -842,10 +943,12 @@ class GodotServer {
   /**
    * Set up the tool handlers for the MCP server
    */
+  private allowedTools: Set<string> = new Set();
+
   private setupToolHandlers() {
     // Define available tools
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: [
+    this.server.setRequestHandler(ListToolsRequestSchema, async () => {
+      const allTools: Array<{ name: string; description: string; inputSchema: any }> = [
         {
           name: 'launch_editor',
           description: 'Launch Godot editor for a specific project',
@@ -3359,12 +3462,24 @@ class GodotServer {
             required: ['projectPath', 'action'],
           },
         },
-      ],
-    }));
+      ];
+      this.allowedTools = resolveAllowedTools(allTools.map((t) => t.name));
+      const tier = (process.env.GODOT_MCP_TIER ?? 'full').toLowerCase();
+      this.logDebug(
+        `Tool tier=${tier} exposed=${this.allowedTools.size}/${allTools.length}`
+      );
+      return { tools: allTools.filter((t) => this.allowedTools.has(t.name)) };
+    });
 
     // Handle tool calls
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       this.logDebug(`Handling tool request: ${request.params.name}`);
+      if (this.allowedTools.size > 0 && !this.allowedTools.has(request.params.name)) {
+        throw new McpError(
+          ErrorCode.MethodNotFound,
+          `Tool "${request.params.name}" is disabled by GODOT_MCP_TIER / GODOT_MCP_DISABLED_TOOLS / GODOT_MCP_ENABLED_TOOLS configuration`
+        );
+      }
       switch (request.params.name) {
         case 'launch_editor':
           return await this.handleLaunchEditor(request.params.arguments);
